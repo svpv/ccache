@@ -38,7 +38,7 @@ struct assoc {
 };
 
 int
-main(int ac, char **argv)
+main(int argc, char **argv)
 {
 	char   *suffix = "", *target_name, *bin_name, *path;
 	const char *call_name = program_invocation_short_name;
@@ -72,19 +72,20 @@ main(int ac, char **argv)
 	if (asprintf(&target_name, "%s-%s%s", target, call_name, suffix) < 0)
 		error(EXIT_FAILURE, errno, "asprintf");
 
-	bin_name = target_name;
+	argv[0] = bin_name = target_name;
 	if (use_ccache)
 	{
 		while (*use_ccache && isspace(*use_ccache))
 			use_ccache++;
-		if (*use_ccache)
-			bin_name = "ccache";
+		if (*use_ccache) {
+			int ccache_main(int argc, char **argv);
+			return ccache_main(argc, argv);
+		}
 	}
 
 	if (asprintf(&path, "%s/%s", BINDIR, bin_name) < 0)
 		error(EXIT_FAILURE, errno, "asprintf");
 
-	argv[0] = target_name;
 	execv(path, argv);
 	perror(path);
 	return EXIT_FAILURE;
