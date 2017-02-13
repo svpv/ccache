@@ -50,8 +50,13 @@ non_3pp_sources = \
 base_sources = $(non_3pp_sources) $(3pp_sources)
 base_objs = $(base_sources:.c=.o)
 
-ccache_sources = main.c $(base_sources)
+ccache_sources = $(base_sources)
 ccache_objs = $(ccache_sources:.c=.o)
+
+main_objs = main.o gccw32.o gccw64.o
+ccache$(EXEEXT): main_obj = main.o
+gccw32$(EXEEXT): main_obj = gccw32.o
+gccw64$(EXEEXT): main_obj = gccw64.o
 
 zlib_sources = \
     zlib/adler32.c zlib/crc32.c zlib/deflate.c zlib/gzclose.c zlib/gzlib.c \
@@ -64,16 +69,16 @@ test_sources = test/main.c test/framework.c test/util.c $(test_suites)
 test_objs = $(test_sources:.c=.o)
 
 all_sources = $(ccache_sources) $(test_sources)
-all_objs = $(ccache_objs) $(test_objs) $(zlib_objs)
-
-files_to_clean = $(all_objs) ccache$(EXEEXT) test/main$(EXEEXT) *~ testdir.*
+all_objs = $(ccache_objs) $(main_objs) $(test_objs) $(zlib_objs)
+all_bin = ccache$(EXEEXT) gccw32$(EXEEXT) gccw64$(EXEEXT)
+files_to_clean = $(all_objs) $(all_bin) test/main$(EXEEXT) *~ testdir.*
 files_to_distclean = Makefile config.h config.log config.status
 
 .PHONY: all
-all: ccache$(EXEEXT)
+all: $(all_bin)
 
-ccache$(EXEEXT): $(ccache_objs) $(extra_libs)
-	$(CC) $(all_cflags) -o $@ $(ccache_objs) $(LDFLAGS) $(extra_libs) $(LIBS)
+$(all_bin): $(ccache_objs) $(main_objs) $(extra_libs)
+	$(CC) $(all_cflags) -o $@ $(ccache_objs) $(main_obj) $(LDFLAGS) $(extra_libs) $(LIBS)
 
 .PHONY: install
 install: all $(srcdir)/ccache.1
@@ -127,7 +132,10 @@ installcheck: ccache$(EXEEXT) test/main$(EXEEXT)
 	test/main$(EXEEXT)
 	CCACHE=$(bindir)/ccache CC='$(CC)' $(srcdir)/test.sh
 
+extra_cppflags =
+gccw32.o: extra_cppflags = -DBINDIR=\"/usr/bin\" -DTARGET=\"i586-alt-linux\"
+gccw64.o: extra_cppflags = -DBINDIR=\"/usr/bin\" -DTARGET=\"x86_64-alt-linux\"
 .c.o:
-	$(CC) $(all_cppflags) $(all_cflags) -c -o $@ $<
+	$(CC) $(all_cppflags) $(extra_cppflags) $(all_cflags) -c -o $@ $<
 
 @include_dev_mk@
