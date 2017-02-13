@@ -1,0 +1,3 @@
+This is a stripped-down version of ccache(1) to be integrated directly into
+/usr/bin/gcc_wrapper.  It removes and otherwise alters some features in a way
+suitable for building rpm packages.
