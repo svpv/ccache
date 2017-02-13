@@ -3,11 +3,23 @@
 #endif
 #include <stdio.h>
 #include <errno.h>
-#include <error.h>
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+#ifdef __GLIBC__
+#include <error.h>
+#else
+#include <libgen.h>
+#define PROG basename(argv[0])
+#define program_invocation_short_name PROG
+#define error(status, errnum, func)	\
+do {					\
+	fprintf(stderr, "%s: %s: %m\n", PROG, func); \
+	if (status) exit(status);	\
+} while (0)
+#endif
 
 struct assoc {
 	const char *name;
