@@ -3,7 +3,7 @@ typedef FILE *gzFile;
 #define gzdopen fdopen
 #define gzclose fclose
 #define gzeof feof_unlocked
-#define gzerror(fp, ret) (*(ret)=errno,"error")
+#define gzerror(fp, ret) (*(ret)=ferror(fp)?-1:0,"error")
 #define gzgetc fgetc_unlocked
 #define gzputc(fp, c) fputc_unlocked(c, fp)
 #define gzputs(fp, s) fputs_unlocked(s, fp)
