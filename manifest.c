@@ -20,7 +20,7 @@
 #include "manifest.h"
 #include "murmurhashneutral2.h"
 
-#include <zlib.h>
+#include "mock-zlib.h"
 
 // Sketchy specification of the manifest disk format:
 //

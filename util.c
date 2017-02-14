@@ -17,7 +17,7 @@
 
 #include "ccache.h"
 
-#include <zlib.h>
+#include "mock-zlib.h"
 
 #ifdef HAVE_PWD_H
 #include <pwd.h>
