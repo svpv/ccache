@@ -22,19 +22,20 @@ do {					\
 #endif
 
 struct assoc {
+	int cacheable;
 	const char *name;
 	const char *value;
 } table[] = {
-	{ "c++", "g++" },
-	{ "cc", "gcc" },
-	{ "f77", "gfortran" },
-	{ "f95", "gfortran" },
-	{ "g77", "gfortran" },
-	{ "gcc_wrapper", "gcc" },
-	{ "jar", "fastjar" },
-	{ "rmic", "grmic" },
-	{ "rmiregistry", "grmiregistry" },
-	{ "tree1", "gtreelang" }
+	{ 1, "c++", "g++" },
+	{ 1, "cc", "gcc" },
+	{ 1, "f77", "gfortran" },
+	{ 1, "f95", "gfortran" },
+	{ 1, "g77", "gfortran" },
+	{ 1, "gcc_wrapper", "gcc" },
+	{ 0, "jar", "fastjar" },
+	{ 0, "rmic", "grmic" },
+	{ 0, "rmiregistry", "grmiregistry" },
+	{ 0, "tree1", "gtreelang" }
 };
 
 int
@@ -45,12 +46,19 @@ main(int argc, char **argv)
 	const char *version = getenv("GCC_VERSION");
 	const char *target = getenv("GCC_TARGET");
 	const char *use_ccache = getenv("GCC_USE_CCACHE");
+	int cacheable = 0;
 	size_t i;
 
 	for (i = 0; i < sizeof(table)/sizeof(table[0]); ++i)
 		if (!strcmp(call_name, table[i].name))
 		{
 			call_name = table[i].value;
+			cacheable = table[i].cacheable;
+			break;
+		}
+		else if (!strcmp(call_name, table[i].value))
+		{
+			cacheable = table[i].cacheable;
 			break;
 		}
 
@@ -73,7 +81,7 @@ main(int argc, char **argv)
 		error(EXIT_FAILURE, errno, "asprintf");
 
 	argv[0] = bin_name = target_name;
-	if (use_ccache)
+	if (use_ccache && cacheable)
 	{
 		while (*use_ccache && isspace(*use_ccache))
 			use_ccache++;
