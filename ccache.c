@@ -29,6 +29,7 @@
 #include "hashutil.h"
 #include "language.h"
 #include "manifest.h"
+#include "rawmemchr2.h"
 
 #define STRINGIFY(x) #x
 #define TO_STRING(x) STRINGIFY(x)
@@ -499,24 +500,8 @@ get_path_in_cache(const char *name, const char *suffix)
 // global included_files variable. If the include file is a PCH, cpp_hash is
 // also updated. Takes over ownership of path.
 static void
-remember_include_file(char *path, struct mdfour *cpp_hash, bool system)
+remember_include_file(char *path, struct mdfour *cpp_hash)
 {
-	size_t path_len = strlen(path);
-	if (path_len >= 2 && (path[0] == '<' && path[path_len - 1] == '>')) {
-		// Typically <built-in> or <command-line>.
-		goto ignore;
-	}
-
-	if (str_eq(path, input_file)) {
-		// Don't remember the input file.
-		goto ignore;
-	}
-
-	if (system && (conf->sloppiness & SLOPPY_NO_SYSTEM_HEADERS)) {
-		// Don't remember this system header.
-		goto ignore;
-	}
-
 	if (hashtable_search(included_files, path)) {
 		// Already known include file.
 		goto ignore;
@@ -547,7 +532,7 @@ remember_include_file(char *path, struct mdfour *cpp_hash, bool system)
 
 	// Canonicalize path for comparison; clang uses ./header.h.
 	char *canonical = path;
-	size_t canonical_len = path_len;
+	size_t canonical_len = strlen(path);
 	if (canonical[0] == '.' && canonical[1] == '/') {
 		canonical += 2;
 		canonical_len -= 2;
@@ -708,6 +693,29 @@ process_preprocessed_file(struct mdfour *hash, const char *path)
 		return false;
 	}
 
+	// Install the sentinels.
+	// - '\0' makes string functions work.
+	// - '\n' permits unbounded EOL searches.
+	// -  '#' permits unbounded search for cpp directives.
+	// - It is important that '\n' goes before '#'.
+	// - Use of rawmemchr2 requires 15 bytes of padding.
+	// - 32 bytes in total should further ensure that memcmp
+	//   can be used instead of string functions.
+	const char sentinels[32] = "\0\n#";
+	data = x_realloc(data, size + sizeof sentinels);
+	memcpy(data + size, sentinels, sizeof sentinels);
+
+	// Below cwd also works as an indicator for !conf->hash_dir.
+	char *cwd = NULL;
+	if (!conf->hash_dir) {
+		cwd = gnu_getcwd();
+		if (!cwd) {
+			// gnu_getcwd warns.
+			free(data);
+			return false;
+		}
+	}
+
 	ignore_headers = NULL;
 	ignore_headers_len = 0;
 	if (!str_eq(conf->ignore_headers_in_manifest, "")) {
@@ -732,16 +740,49 @@ process_preprocessed_file(struct mdfour *hash, const char *path)
 	char *q = data;
 	char *end = data + size;
 
-	// There must be at least 7 characters (# 1 "x") left to potentially find an
-	// include file path.
-	while (q < end - 7) {
+	// Indicates whether cpp produces output with FLAGS,
+	// such as in <info cpp "Preprocessor Output">.
+	bool cppflags = false;
+
+	while (1) {
+		q = rawmemchr2(q, '#', '.');
+		// There must be at least 7 characters (# 1 "x") left to potentially
+		// find an include file path.  (The same also holds true for .incbin
+		// directives.  The check also handles the sentinel.)
+		if (!(q < end - 7)) {
+			break;
+		}
+		if (*q == '#') {
+			// Only interested in "#" at the beginning of a line.
+			if (!(q == data || q[-1] == '\n')) {
+				q++;
+				continue;
+			}
+		} else {
+			// It starts with a dot, but hardly ever matches the .incbin
+			// directive, although there are some .index and .insert methods
+			// out there.  Try to get out of the trap with fewer losses.
+			if (q[1] != 'i') { q += 1; continue; }
+			if (q[2] != 'n') { q += 2; continue; }
+			if (q[3] != 'c') { q += 3; continue; }
+			if (q[4] != 'b') { q += 4; continue; }
+			if (q[5] != 'i') { q += 5; continue; }
+			if (q[6] != 'n') { q += 6; continue; }
+			// An assembler .incbin statement (which could be part of inline
+			// assembly) refers to an external file. If the file changes, the hash
+			// should change as well, but finding out what file to hash is too hard
+			// for ccache, so just bail out.
+			cc_log("Found unsupported .incbin directive in source code");
+			stats_update(STATS_UNSUPPORTED_DIRECTIVE);
+			failed();
+		}
 		// Check if we look at a line containing the file name of an included file.
 		// At least the following formats exist (where N is a positive integer):
 		//
 		// GCC:
 		//
-		//   # N "file"
-		//   # N "file" N
+		//   # N "file"			(aka gccline, can have flags)
+		//   # N "file" N		(aka gccline, can have flags)
 		//   #pragma GCC pch_preprocess "file"
 		//
 		// HP's compiler:
@@ -755,112 +796,183 @@ process_preprocessed_file(struct mdfour *hash, const char *path)
 		//
 		// Note that there may be other lines starting with '#' left after
 		// preprocessing as well, for instance "#    pragma".
-		if (q[0] == '#'
-		    // GCC:
-		    && ((q[1] == ' ' && q[2] >= '0' && q[2] <= '9')
-		        // GCC precompiled header:
-		        || (q[1] == 'p'
-		            && str_startswith(&q[2], "ragma GCC pch_preprocess "))
-		        // HP/AIX:
-		        || (q[1] == 'l' && q[2] == 'i' && q[3] == 'n' && q[4] == 'e'
-		            && q[5] == ' '))
-		    && (q == data || q[-1] == '\n')) {
-			// Workarounds for preprocessor linemarker bugs in GCC version 6.
-			if (q[2] == '3') {
-				if (str_startswith(q, "# 31 \"<command-line>\"\n")) {
-					// Bogus extra line with #31, after the regular #1: Ignore the whole
-					// line, and continue parsing.
+		bool pragma = false;
+		bool gccline = false;
+		bool firstline = false;
+		if (q[1] == ' ' && is_digit(q[2])) {
+			gccline = true;
+			if (q[2] == '1') {
+				firstline = q[3] == ' ';
+			} else if (q[2] == '3') {
+				// Workarounds for preprocessor linemarker bugs in GCC version 6.
+				const char line31[] = "# 31 \"<command-line>\"\n";
+				const char line32[] = "# 32 \"<command-line>\" 2\n";
+				if (mem_eq(&q[3], &line31[3], sizeof(line31) - 4)) {
+					// Bogus extra line with #31, after the regular #1:
+					// Ignore the whole line, and continue parsing.
 					hash_buffer(hash, p, q - p);
-					while (q < end && *q != '\n') {
-						q++;
-					}
-					q++;
+					q += sizeof(line31) - 1;
 					p = q;
 					continue;
-				} else if (str_startswith(q, "# 32 \"<command-line>\" 2\n")) {
-					// Bogus wrong line with #32, instead of regular #1: Replace the line
-					// number with the usual one.
+				} else if (mem_eq(&q[3], &line32[3], sizeof(line32) - 4)) {
+					// Bogus wrong line with #32, instead of regular #1:
+					// Replace the line number with the usual one.
 					hash_buffer(hash, p, q - p);
+					// Fix in place, will hash later.
 					q += 1;
 					q[0] = '#';
 					q[1] = ' ';
 					q[2] = '1';
 					p = q;
+					// No need to set firstline, only relevant for files.
 				}
 			}
-
-			while (q < end && *q != '"' && *q != '\n') {
-				q++;
-			}
-			if (q < end && *q == '\n') {
-				// A newline before the quotation mark -> no match.
-				continue;
-			}
+			// Advance towards the opening quote.
+			q += sizeof("# 1") - 1;
+		} else if (q[1] == 'p' && mem_eqs(&q[2], "ragma GCC pch_preprocess ")) {
+			// GCC precompiled header.
+			pragma = true;
+			q += sizeof("#pragma GCC pch_preprocess ") - 1;
+		} else if (q[1] == 'l' && mem_eqs(&q[2], "ine ") && is_digit(q[6])) {
+			// HP/AIX.
+			firstline = q[6] == '1' && q[7] == ' ';
+			q += sizeof("#line 1") - 1;
+		} else {
 			q++;
-			if (q >= end) {
-				cc_log("Failed to parse included file path");
-				free(data);
-				return false;
-			}
-			// q points to the beginning of an include file path
-			hash_buffer(hash, p, q - p);
-			p = q;
-			while (q < end && *q != '"') {
-				q++;
-			}
-			// Look for preprocessor flags, after the "filename".
-			bool system = false;
-			char *r = q + 1;
-			while (r < end && *r != '\n') {
-				if (*r == '3') { // System header.
+			continue;
+		}
+
+		// Find the opening quotation mark.
+		// Just a few characters to skip, no need for rawmemchr2.
+		while (*q != '"' && *q != '\n') {
+			q++;
+		}
+		if (*q == '\n') {
+			// A newline before the opening quotation mark,
+			// or possibly end of input -> no match.
+			continue;
+		}
+		q++;
+		// q points to the beginning of an include file path.
+		hash_buffer(hash, p, q - p);
+		p = q;
+
+		// Find the closing quotation mark.
+		q = rawmemchr2(q, '"', '\n');
+		if (*q == '\n') {
+			// A newline before the closing quotation mark,
+			// or possibly end of input -> parse error.
+			cc_log("Failed to parse included file path");
+			free(data);
+			free(cwd);
+			return false;
+		}
+
+		// p and q span the include file path.
+		char *inc_path = p;
+		size_t len = q - p;
+		*q = '\0';
+
+		// Look for preprocessor flags, after the "filename".
+		bool system = false;
+		bool entering = false;
+		bool lineflags = false;
+		// r points past the closing quote.
+		char *r = q + 1;
+		if (gccline) {
+			while (*r != '\n') {
+				switch (*r) {
+				case '1': // Start of a new file.
+					entering = true;
+					// Fall through.
+				case '2': // Returning to a file.
+					cppflags = lineflags = true;
+					break;
+				case '3': // System header.
 					system = true;
+					cppflags = lineflags = true;
 				}
 				r++;
 			}
-			// p and q span the include file path.
-			char *inc_path = x_strndup(p, q - p);
-			if (!has_absolute_include_headers) {
-				has_absolute_include_headers = is_absolute_path(inc_path);
-			}
-			inc_path = make_relative_path(inc_path);
-
-			bool should_hash_inc_path = true;
-			if (!conf->hash_dir) {
-				char *cwd = gnu_getcwd();
-				if (str_startswith(inc_path, cwd) && str_endswith(inc_path, "//")) {
-					// When compiling with -g or similar, GCC adds the absolute path to
-					// CWD like this:
-					//
-					//   # 1 "CWD//"
-					//
-					// If the user has opted out of including the CWD in the hash, don't
-					// hash it. See also how debug_prefix_map is handled.
-					should_hash_inc_path = false;
-				}
-				free(cwd);
-			}
-			if (should_hash_inc_path) {
-				hash_string(hash, inc_path);
-			}
-
-			remember_include_file(inc_path, hash, system);
-			p = q; // Everything of interest between p and q has been hashed now.
-		} else if (q[0] == '.' && q[1] == 'i' && q[2] == 'n' && q[3] == 'c'
-		           && q[4] == 'b' && q[5] == 'i' && q[6] == 'n') {
-			// An assembler .incbin statement (which could be part of inline
-			// assembly) refers to an external file. If the file changes, the hash
-			// should change as well, but finding out what file to hash is too hard
-			// for ccache, so just bail out.
-			cc_log("Found unsupported .incbin directive in source code");
-			stats_update(STATS_UNSUPPORTED_DIRECTIVE);
-			failed();
-		} else {
-			q++;
+			// r points past newline.
+			r++;
 		}
+
+		// See if remember_include_file needs to be called.
+		// First off, if filename comes from a #pragma directive,
+		// there are no flags or line information, and there is
+		// no way the call can be optimized out.
+		bool remember = pragma
+			// If cpp output has flags, each file only has to be
+			// remembered once, upon entering.  Otherwise, check
+			// if the line is the first line in a file.
+			|| (cppflags ? entering : firstline)
+			// There's also a special case: when Perl's xsubpp
+			// puts <#line 1 "Foo.xs"> into Foo.c, the line
+			// ends up showing up as <# 1 "Foo.c"> with no flags.
+			|| (firstline && !lineflags);
+		// No need to remember some files, though: special files
+		// such as <built-in> or <command-line>, and directories such
+		// as "CWD//" (see below).  System header sloppiness is also
+		// applied here.  The check for input_file has to be done
+		// after inc_path is made relative, though.
+		if (remember
+		    && ((*p == '<' && q[-1] == '>') || q[-1] == '/'
+			|| (system && (conf->sloppiness & SLOPPY_NO_SYSTEM_HEADERS)))) {
+			remember = false;
+		}
+
+		// Check if the path has to be made relative, i.e. if it matches
+		// the base_dir.  Looking at only two characters is often enough
+		// to optimize out the call, such as with base_dir="/home" and
+		// inc_path="/usr/include/stdio.h".
+		bool mkrel = conf->base_dir[0] && conf->base_dir[0] == inc_path[0]
+			&& (!conf->base_dir[1] || conf->base_dir[1] == inc_path[1]);
+		// Sometimes copying can be avoided.
+		if (mkrel || remember) {
+			inc_path = x_malloc(len + 1);
+			memcpy(inc_path, p, len + 1);
+		}
+		if (!has_absolute_include_headers) {
+			has_absolute_include_headers = is_absolute_path(inc_path);
+		}
+		if (mkrel) {
+			inc_path = make_relative_path(inc_path);
+			len = strlen(inc_path);
+		}
+		// Don't remember the input file.
+		if (remember && str_eq(inc_path, input_file)) {
+			remember = false;
+		}
+		// This check would make more sense before making inc_path relative,
+		// but that's how things are for now, for the sake of full compatibility.
+		if (cwd && str_startswith(inc_path, cwd) && str_endswith(inc_path, "//")) {
+			// When compiling with -g or similar, GCC adds the absolute path to
+			// CWD like this:
+			//
+			//   # 1 "CWD//"
+			//
+			// If the user has opted out of including the CWD in the hash, don't
+			// hash it. See also how debug_prefix_map is handled.
+			if (inc_path != p) {
+				free(inc_path);
+			}
+		} else {
+			hash_buffer(hash, inc_path, len);
+			if (remember) {
+				remember_include_file(inc_path, hash);
+			} else if (inc_path != p) {
+				free(inc_path);
+			}
+		}
+		*q = '"';
+		p = q; // Everything of interest between p and q has been hashed now.
+		q = r; // Skip past the closing quote or past newline.
 	}
 
-	hash_buffer(hash, p, (end - p));
+	hash_buffer(hash, p, end - p);
 	free(data);
+	free(cwd);
 
 	// Explicitly check the .gch/.pch/.pth file, Clang does not include any
 	// mention of it in the preprocessed output.
@@ -868,7 +980,7 @@ process_preprocessed_file(struct mdfour *hash, const char *path)
 		char *path = x_strdup(included_pch_file);
 		path = make_relative_path(path);
 		hash_string(hash, path);
-		remember_include_file(path, hash, false);
+		remember_include_file(path, hash);
 	}
 
 	return true;

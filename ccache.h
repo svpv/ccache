@@ -77,6 +77,11 @@ enum stats {
 	(strlen(s) >= strlen(suffix) \
 	 && str_eq((s) + strlen(s) - strlen(suffix), (suffix)))
 
+#define mem_eq(p1, p2, n) (memcmp(p1, p2, n) == 0)
+#define mem_eqs(p, s) mem_eq(p, s "", sizeof(s) - 1)
+
+#define is_digit(c) ((unsigned) (c) - '0' < 10)
+
 // Buffer size for I/O operations. Should be a multiple of 4 KiB.
 #define READ_BUFFER_SIZE 65536
 
