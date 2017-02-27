@@ -37,7 +37,7 @@ static struct mdfour *m;
 
 // This applies md4 to 64 byte chunks.
 static void
-mdfour64(uint32_t *M)
+mdfour64(const uint32_t *M)
 {
 	uint32_t AA, BB, CC, DD;
 	uint32_t A, B, C, D;
@@ -95,6 +95,19 @@ mdfour64(uint32_t *M)
 	m->D = D;
 }
 
+// No copying is required on little-endian machines with fast unaligned reads.
+// On Haswell at least, unaligned reads are slightly faster than copying with
+// SSE2 inlined assembly.
+#if defined(__i386__) || defined(__x86_64__)
+#define MDFOUR64(in) mdfour64((const uint32_t *) (in))
+#else
+#define MDFOUR64(in)			\
+	do {				\
+		uint32_t M[16];		\
+		copy64(M, in);		\
+		mdfour64(M);		\
+	} while (0)
+
 static void
 copy64(uint32_t *M, const unsigned char *in)
 {
@@ -107,6 +120,7 @@ copy64(uint32_t *M, const unsigned char *in)
 	memcpy(M, in, 16*4);
 #endif
 }
+#endif
 
 static void
 copy4(unsigned char *out, uint32_t x)
@@ -139,7 +153,6 @@ void mdfour_tail(const unsigned char *in, size_t n)
 	m->totalN += n;
 	uint32_t b = m->totalN * 8;
 	unsigned char buf[128] = { 0 };
-	uint32_t M[16];
 	if (n) {
 		memcpy(buf, in, n);
 	}
@@ -147,14 +160,11 @@ void mdfour_tail(const unsigned char *in, size_t n)
 
 	if (n <= 55) {
 		copy4(buf+56, b);
-		copy64(M, buf);
-		mdfour64(M);
+		MDFOUR64(buf);
 	} else {
 		copy4(buf+120, b);
-		copy64(M, buf);
-		mdfour64(M);
-		copy64(M, buf+64);
-		mdfour64(M);
+		MDFOUR64(buf);
+		MDFOUR64(buf+64);
 	}
 }
 
@@ -179,7 +189,6 @@ mdfour_update(struct mdfour *md, const unsigned char *in, size_t n)
 		return;
 	}
 
-	uint32_t M[16];
 	if (md->tail_len) {
 		size_t len = 64 - md->tail_len;
 		if (len > n) {
@@ -190,16 +199,14 @@ mdfour_update(struct mdfour *md, const unsigned char *in, size_t n)
 		n -= len;
 		in += len;
 		if (md->tail_len == 64) {
-			copy64(M, md->tail);
-			mdfour64(M);
+			MDFOUR64(md->tail);
 			m->totalN += 64;
 			md->tail_len = 0;
 		}
 	}
 
 	while (n >= 64) {
-		copy64(M, in);
-		mdfour64(M);
+		MDFOUR64(in);
 		in += 64;
 		n -= 64;
 		m->totalN += 64;
